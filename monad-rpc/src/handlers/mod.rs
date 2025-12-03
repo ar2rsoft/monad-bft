@@ -339,6 +339,65 @@ async fn debug_traceCall(
 }
 
 #[allow(non_snake_case)]
+async fn debug_traceCallMany(
+    _: RequestId,
+    app_state: &MonadRpcResources,
+    params: RequestParams<'_>,
+) -> Result<Box<RawValue>, JsonRpcError> {
+    use futures::future::join_all;
+
+    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
+    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
+        return Err(JsonRpcError::method_not_supported());
+    };
+
+    // лимитер общий — значит этот запрос потребляет 1 слот
+    let _permit = &app_state
+        .rate_limiter
+        .try_acquire()
+        .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
+
+    // ожидаем массив JSON-параметров, каждый идентичен params для traceCall
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(params.get()).invalid_params()?;
+
+    // Распараллеливаем N штук traceCall
+    let futures_iter = items.into_iter().map(|item| {
+        let triedb_env = triedb_env.clone();
+        let executor = eth_call_executor.clone();
+        let chain_id = app_state.chain_id;
+        let gas_limit = app_state.eth_call_provider_gas_limit;
+
+        async move {
+            // params должен быть T же, что и в обычном traceCall
+            let parsed_params =
+                serde_json::from_value(item).invalid_params()?;
+
+            monad_debug_traceCall(
+                &triedb_env,
+                executor,
+                chain_id,
+                gas_limit,
+                parsed_params,
+            )
+                .await
+                .map(serialize_result)
+        }
+    });
+
+    // Выполняем параллельно
+    let results = join_all(futures_iter).await;
+
+    // Превращаем Vec<Result<Box<RawValue>, JsonRpcError>> → Result<Vec<Box<RawValue>>, JsonRpcError>
+    let mut out = Vec::new();
+    for r in results {
+        out.push(r?);
+    }
+
+    serialize_result(&out)
+}
+
+#[allow(non_snake_case)]
 async fn debug_traceTransaction(
     request_id: RequestId,
     app_state: &MonadRpcResources,
