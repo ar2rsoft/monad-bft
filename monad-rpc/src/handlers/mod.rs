@@ -999,6 +999,7 @@ enabled_methods!(
     debug_traceBlockByHash,
     debug_traceBlockByNumber,
     debug_traceCall,
+    debug_traceCallMany,
     debug_traceTransaction,
     eth_call,
     eth_sendRawTransaction,
