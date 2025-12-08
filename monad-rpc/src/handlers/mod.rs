@@ -347,7 +347,7 @@ async fn debug_traceCallMany(
 ) -> Result<Box<RawValue>, JsonRpcError> {
     use serde_json::{Value, from_value, json, to_value};
     use serde_json::value::RawValue;
-    
+
     // парсим входной JSON
     let input: Value = serde_json::from_str(params.get()).invalid_params()?;
 
@@ -394,8 +394,15 @@ async fn debug_traceCallMany(
     }
 
     // возвращаем массив результатов
-    let results_json = serde_json::to_string(&results).map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
-    Ok(Box::from(results_json))
+    // let results_json = serde_json::to_string(&results).map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+    // Ok(Box::from(results_json))
+    let results_raw: Vec<Box<RawValue>> = results
+        .into_iter()
+        .map(|r| serde_json::value::to_raw_value(&r).map_err(|e| JsonRpcError::internal_error(e.to_string())))
+        .collect::<Result<_, _>>()?;
+
+    Ok(serde_json::value::to_raw_value(&results_raw)?
+        .into())
 }
 
 #[allow(non_snake_case)]
