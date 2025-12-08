@@ -378,8 +378,8 @@ async fn debug_traceCallMany(
         // Build a JSON object matching MonadDebugTraceCallParams and deserialize into it.
         let per_call_val = serde_json::json!({
             "transaction": tx,
-            "block": block_v,
-            "tracer": tracer_v,
+            "block": block_v.clone(),
+            "tracer": tracer_v.clone(),
         });
         let per_call: MonadDebugTraceCallParams =
             serde_json::from_value(per_call_val).map_err(|_| JsonRpcError::invalid_params())?;
