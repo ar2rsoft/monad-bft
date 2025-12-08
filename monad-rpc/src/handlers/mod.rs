@@ -338,63 +338,64 @@ async fn debug_traceCall(
     .map(serialize_result)?
 }
 
+
 #[allow(non_snake_case)]
 async fn debug_traceCallMany(
     _: RequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    use futures::future::join_all;
+    use serde_json::{Value, from_value, json, to_value};
+    use serde_json::value::RawValue;
+    
+    // парсим входной JSON
+    let input: Value = serde_json::from_str(params.get()).invalid_params()?;
 
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
-    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-
-    // лимитер общий — значит этот запрос потребляет 1 слот
-    let _permit = &app_state
-        .rate_limiter
-        .try_acquire()
-        .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
-
-    // ожидаем массив JSON-параметров, каждый идентичен params для traceCall
-    let items: Vec<serde_json::Value> =
-        serde_json::from_str(params.get()).invalid_params()?;
-
-    // Распараллеливаем N штук traceCall
-    let futures_iter = items.into_iter().map(|item| {
-        let triedb_env = triedb_env.clone();
-        let executor = eth_call_executor.clone();
-        let chain_id = app_state.chain_id;
-        let gas_limit = app_state.eth_call_provider_gas_limit;
-
-        async move {
-            // params должен быть T же, что и в обычном traceCall
-            let parsed_params =
-                serde_json::from_value(item).invalid_params()?;
-
-            monad_debug_traceCall(
-                &triedb_env,
-                executor,
-                chain_id,
-                gas_limit,
-                parsed_params,
-            )
-                .await
-                .map(serialize_result)
-        }
-    });
-
-    // Выполняем параллельно
-    let results = join_all(futures_iter).await;
-
-    // Превращаем Vec<Result<Box<RawValue>, JsonRpcError>> → Result<Vec<Box<RawValue>>, JsonRpcError>
-    let mut out = Vec::new();
-    for r in results {
-        out.push(r?);
+    // проверяем, что входной формат соответствует [transactions_array, block_ref, tracer_obj]
+    let input_array = input.as_array().ok_or_else(|| JsonRpcError::invalid_params())?;
+    if input_array.len() != 3 {
+        return Err(JsonRpcError::invalid_params());
     }
 
-    serialize_result(&out)
+    let txs = input_array[0].as_array().ok_or_else(|| JsonRpcError::invalid_params())?;
+    let block_ref = &input_array[1];
+    let tracer_obj = &input_array[2];
+
+    let mut results = Vec::with_capacity(txs.len());
+
+    for tx in txs {
+        // формируем объект в том виде, который ждет monad_debug_traceCall
+        let call_params = json!([tx, block_ref, tracer_obj]);
+        let call_params_str = to_value(&call_params).to_string();
+        let parsed_params: eth::call::MonadDebugTraceCallParams =
+            serde_json::from_str(&call_params_str).invalid_params()?;
+
+        let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
+        let Some(ref eth_call_executor) = app_state.eth_call_executor else {
+            return Err(JsonRpcError::method_not_supported());
+        };
+
+        let _permit = &app_state
+            .rate_limiter
+            .try_acquire()
+            .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
+
+        let result = monad_debug_traceCall(
+            triedb_env,
+            eth_call_executor.clone(),
+            app_state.chain_id,
+            app_state.eth_call_provider_gas_limit,
+            parsed_params,
+        )
+            .await
+            .map(serialize_result)?;
+
+        results.push(result);
+    }
+
+    // возвращаем массив результатов
+    let results_json = serde_json::to_string(&results).map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+    Ok(Box::from(results_json))
 }
 
 #[allow(non_snake_case)]
