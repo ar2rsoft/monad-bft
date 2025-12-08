@@ -344,7 +344,8 @@ async fn debug_traceCallMany(
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    use crate::handlers::eth::call::{CallRequest, MonadDebugTraceCallParams};
+    use crate::eth_json_types::BlockTagOrHash;
+    use crate::handlers::eth::call::{CallRequest, EnrichedTracerObject};
 
     let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
     let Some(ref eth_call_executor) = app_state.eth_call_executor else {
@@ -358,50 +359,28 @@ async fn debug_traceCallMany(
         .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
 
     // Expected params format: [ [CallRequest, ...], BlockTagOrHash, { tracer: ... } ]
-    // Parse as generic JSON first to avoid accessing private fields of inner structs.
+    // Parse as generic JSON first
     let root_val: serde_json::Value = serde_json::from_str(params.get()).invalid_params()?;
-
     let arr = root_val.as_array().ok_or_else(JsonRpcError::invalid_params)?;
     if arr.len() != 3 {
         return Err(JsonRpcError::invalid_params());
     }
 
-    // First element: array of call requests
     let calls: Vec<CallRequest> = serde_json::from_value(arr[0].clone()).invalid_params()?;
-    // Second and third elements: keep as raw JSON values to reassemble per-call params
-    let block_v = arr[1].clone();
-    let tracer_v = arr[2].clone();
+    let block: BlockTagOrHash = serde_json::from_value(arr[1].clone()).invalid_params()?;
+    let tracer: EnrichedTracerObject = serde_json::from_value(arr[2].clone()).invalid_params()?;
 
-    let mut results: Vec<serde_json::Value> = Vec::with_capacity(calls.len());
-
-    for tx in calls.into_iter() {
-        // Build a JSON object matching MonadDebugTraceCallParams and deserialize into it.
-        let per_call_val = serde_json::json!({
-            "transaction": tx,
-            "block": block_v.clone(),
-            "tracer": tracer_v.clone(),
-        });
-        let per_call: MonadDebugTraceCallParams =
-            serde_json::from_value(per_call_val).map_err(|_| JsonRpcError::invalid_params())?;
-
-        let raw = crate::handlers::eth::call::monad_debug_traceCall(
-            triedb_env,
-            eth_call_executor.clone(),
-            app_state.chain_id,
-            app_state.eth_call_provider_gas_limit,
-            per_call,
-        )
-        .await?;
-
-        // Convert Box<RawValue> into serde_json::Value to build an array
-        let v: serde_json::Value = serde_json::from_str(raw.get()).map_err(|e| {
-            JsonRpcError::internal_error(format!("json parse error: {}", e))
-        })?;
-        results.push(v);
-    }
-
-    // Serialize Vec<Value> as the final result
-    serialize_result(results)
+    crate::handlers::eth::call::monad_debug_traceCallMany(
+        triedb_env,
+        eth_call_executor.clone(),
+        app_state.chain_id,
+        app_state.eth_call_provider_gas_limit,
+        calls,
+        block,
+        tracer,
+    )
+    .await
+    .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]

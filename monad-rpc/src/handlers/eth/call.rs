@@ -866,6 +866,170 @@ pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
     }
 }
 
+/// Executes multiple debug_traceCall-style requests sequentially while preserving state across the batch.
+/// Each call sees the effects of all previous successful calls in the same batch via a cumulative
+/// StateOverrideSet we maintain locally. The return value is an array with one element per input call,
+/// each formatted exactly like `debug_traceCall` for the selected tracer.
+#[allow(non_snake_case)]
+pub async fn monad_debug_traceCallMany<T: Triedb + TriedbPath>(
+    triedb_env: &T,
+    eth_call_executor: Arc<EthCallExecutor>,
+    chain_id: u64,
+    eth_call_gas_limit: u64,
+    calls: Vec<CallRequest>,
+    block: BlockTagOrHash,
+    tracer: EnrichedTracerObject,
+) -> JsonRpcResult<Box<RawValue>> {
+    // Resolve block key once
+    let block_key = get_block_key_from_tag_or_hash(triedb_env, block.clone()).await?;
+
+    // Accumulated overrides between calls; start with any overrides supplied by the client
+    let mut overrides = tracer.state_overrides.clone();
+
+    // Helper closures to read/update balances with overrides considered
+    async fn current_balance<TT: Triedb>(
+        triedb: &TT,
+        block_key: BlockKey,
+        overrides: &StateOverrideSet,
+        addr: Address,
+    ) -> Result<U256, JsonRpcError> {
+        if let Some(obj) = overrides.get(&addr) {
+            if let Some(bal) = obj.balance {
+                return Ok(bal);
+            }
+        }
+        let account = triedb
+            .get_account(block_key, addr.into())
+            .await
+            .map_err(JsonRpcError::internal_error)?;
+        Ok(U256::from(account.balance))
+    }
+
+    fn set_balance_override(
+        overrides: &mut StateOverrideSet,
+        addr: Address,
+        new_balance: U256,
+    ) {
+        use monad_ethcall::StateOverrideObject;
+        overrides
+            .entry(addr)
+            .and_modify(|o| o.balance = Some(new_balance))
+            .or_insert_with(|| StateOverrideObject {
+                balance: Some(new_balance),
+                ..Default::default()
+            });
+    }
+
+    // Collect per-call JSON results
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(calls.len());
+
+    for mut tx in calls.into_iter() {
+        // Build params with the current cumulative overrides
+        let mut tracer_enriched = tracer.clone();
+        tracer_enriched.state_overrides = overrides.clone();
+        let params = MonadDebugTraceCallParams {
+            transaction: tx.clone(),
+            block: block.clone(),
+            tracer: tracer_enriched,
+        };
+
+        // Determine tracer kind and execute similarly to monad_debug_traceCall, but also
+        // track whether execution was a success to update overrides.
+        let call_params = CallParams::Trace(params.clone());
+        let monad_tracer = call_params.monad_tracer();
+
+        let call_result = prepare_eth_call(
+            triedb_env,
+            eth_call_executor.clone(),
+            chain_id,
+            eth_call_gas_limit,
+            call_params,
+        )
+        .await?;
+
+        let (raw_payload, was_success) = match call_result {
+            CallResult::Success(monad_ethcall::SuccessCallResult { output_data, .. }) => {
+                (output_data, true)
+            }
+            CallResult::Failure(error) => {
+                return Err(JsonRpcError::eth_call_error(error.message, error.data))
+            }
+            CallResult::Revert(result) => (result.trace, false),
+        };
+
+        // Convert payload into the expected JSON per tracer and push to results
+        let json_value = match monad_tracer {
+            MonadTracer::CallTracer => {
+                let mut slice: &[u8] = raw_payload.as_slice();
+                let frame = decode_call_frame(
+                    triedb_env,
+                    &mut slice,
+                    block_key,
+                    &params.tracer.tracer_params,
+                )
+                .await?;
+                serde_json::to_value(&frame).map_err(|e| {
+                    JsonRpcError::internal_error(format!(
+                        "json serialization error: {}",
+                        e
+                    ))
+                })?
+            }
+            MonadTracer::PreStateTracer | MonadTracer::StateDiffTracer => {
+                let v: serde_cbor::Value = serde_cbor::from_slice(&raw_payload).map_err(|e| {
+                    JsonRpcError::internal_error(format!("cbor decode error: {}", e))
+                })?;
+                serde_json::to_value(&v).map_err(|e| {
+                    JsonRpcError::internal_error(format!(
+                        "json serialization error: {}",
+                        e
+                    ))
+                })?
+            }
+            MonadTracer::AccessListTracer => return Err(JsonRpcError::invalid_params()),
+            MonadTracer::NoopTracer => serde_json::Value::Null,
+        };
+        results.push(json_value);
+
+        // If execution succeeded, update simple balance/nonce overrides so later calls see it.
+        if was_success {
+            if let Some(from) = tx.from {
+                let value = tx.value.unwrap_or_default();
+                if !value.is_zero() {
+                    let from_balance = current_balance(triedb_env, block_key, &overrides, from)
+                        .await?;
+                    let new_from_balance = from_balance.saturating_sub(value);
+                    set_balance_override(&mut overrides, from, new_from_balance);
+                }
+
+                // Increment sender nonce override by 1 to simulate tx nonce consumption.
+                use monad_ethcall::StateOverrideObject;
+                overrides
+                    .entry(from)
+                    .and_modify(|o| {
+                        o.nonce = Some(o.nonce.unwrap_or(U64::from(0)) + U64::from(1));
+                    })
+                    .or_insert_with(|| StateOverrideObject {
+                        nonce: Some(U64::from(1)),
+                        ..Default::default()
+                    });
+            }
+
+            if let Some(to) = tx.to {
+                let value = tx.value.unwrap_or_default();
+                if !value.is_zero() {
+                    let to_balance = current_balance(triedb_env, block_key, &overrides, to).await?;
+                    let new_to_balance = to_balance.saturating_add(value);
+                    set_balance_override(&mut overrides, to, new_to_balance);
+                }
+            }
+        }
+    }
+
+    serde_json::value::to_raw_value(&results)
+        .map_err(|e| JsonRpcError::internal_error(format!("json serialization error: {}", e)))
+}
+
 /// Returns an access list containing all addresses and storage slots accessed during a simulated transaction.
 #[rpc(
     method = "eth_createAccessList",
