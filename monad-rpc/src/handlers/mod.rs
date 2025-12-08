@@ -401,8 +401,7 @@ async fn debug_traceCallMany(
         .map(|r| serde_json::value::to_raw_value(&r).map_err(|e| JsonRpcError::internal_error(e.to_string())))
         .collect::<Result<_, _>>()?;
 
-    Ok(serde_json::value::to_raw_value(&results_raw)?
-        .into())
+    Ok(serde_json::value::to_raw_value(&results_raw).into())
 }
 
 #[allow(non_snake_case)]
