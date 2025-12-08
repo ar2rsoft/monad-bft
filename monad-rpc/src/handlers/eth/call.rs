@@ -938,21 +938,47 @@ pub async fn monad_debug_traceCallMany<T: Triedb + TriedbPath>(
         let call_params = CallParams::Trace(params.clone());
         let monad_tracer = call_params.monad_tracer();
 
-        let call_result = prepare_eth_call(
+        // Execute and catch per-transaction preparation/runtime errors so we can
+        // return an itemized error instead of failing the whole batch.
+        let call_result = match prepare_eth_call(
             triedb_env,
             eth_call_executor.clone(),
             chain_id,
             eth_call_gas_limit,
             call_params,
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Push per-item JSON-RPC style error object and continue
+                results.push(serde_json::json!({
+                    "error": {
+                        "code": e.code,
+                        "message": e.message,
+                        // include data only if present
+                        "data": e.data
+                    }
+                }));
+                continue;
+            }
+        };
 
         let (raw_payload, was_success) = match call_result {
             CallResult::Success(monad_ethcall::SuccessCallResult { output_data, .. }) => {
                 (output_data, true)
             }
             CallResult::Failure(error) => {
-                return Err(JsonRpcError::eth_call_error(error.message, error.data))
+                // Do NOT fail the entire RPC; report error for this transaction only
+                results.push(serde_json::json!({
+                    "error": {
+                        "code": -32603,
+                        "message": error.message,
+                        "data": error.data
+                    }
+                }));
+                // Skip state updates for failed tx and continue to next
+                continue;
             }
             CallResult::Revert(result) => (result.trace, false),
         };
