@@ -338,70 +338,70 @@ async fn debug_traceCall(
     .map(serialize_result)?
 }
 
-
 #[allow(non_snake_case)]
 async fn debug_traceCallMany(
     _: RequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    use serde_json::{Value, from_value, json, to_value};
-    use serde_json::value::RawValue;
+    use crate::handlers::eth::call::{CallRequest, MonadDebugTraceCallParams};
 
-    // парсим входной JSON
-    let input: Value = serde_json::from_str(params.get()).invalid_params()?;
+    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
+    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
+        return Err(JsonRpcError::method_not_supported());
+    };
 
-    // проверяем, что входной формат соответствует [transactions_array, block_ref, tracer_obj]
-    let input_array = input.as_array().ok_or_else(|| JsonRpcError::invalid_params())?;
-    if input_array.len() != 3 {
+    // acquire the concurrent requests permit
+    let _permit = &app_state
+        .rate_limiter
+        .try_acquire()
+        .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
+
+    // Expected params format: [ [CallRequest, ...], BlockTagOrHash, { tracer: ... } ]
+    // Parse as generic JSON first to avoid accessing private fields of inner structs.
+    let root_val: serde_json::Value = serde_json::from_str(params.get()).invalid_params()?;
+
+    let arr = root_val.as_array().ok_or_else(JsonRpcError::invalid_params)?;
+    if arr.len() != 3 {
         return Err(JsonRpcError::invalid_params());
     }
 
-    let txs = input_array[0].as_array().ok_or_else(|| JsonRpcError::invalid_params())?;
-    let block_ref = &input_array[1];
-    let tracer_obj = &input_array[2];
+    // First element: array of call requests
+    let calls: Vec<CallRequest> = serde_json::from_value(arr[0].clone()).invalid_params()?;
+    // Second and third elements: keep as raw JSON values to reassemble per-call params
+    let block_v = arr[1].clone();
+    let tracer_v = arr[2].clone();
 
-    let mut results = Vec::with_capacity(txs.len());
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(calls.len());
 
-    for tx in txs {
-        // формируем объект в том виде, который ждет monad_debug_traceCall
-        let call_params = json!([tx, block_ref, tracer_obj]);
-        let call_params_str = to_value(&call_params).to_string();
-        let parsed_params: eth::call::MonadDebugTraceCallParams =
-            serde_json::from_str(&call_params_str).invalid_params()?;
+    for tx in calls.into_iter() {
+        // Build a JSON object matching MonadDebugTraceCallParams and deserialize into it.
+        let per_call_val = serde_json::json!({
+            "transaction": tx,
+            "block": block_v,
+            "tracer": tracer_v,
+        });
+        let per_call: MonadDebugTraceCallParams =
+            serde_json::from_value(per_call_val).map_err(|_| JsonRpcError::invalid_params())?;
 
-        let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
-        let Some(ref eth_call_executor) = app_state.eth_call_executor else {
-            return Err(JsonRpcError::method_not_supported());
-        };
-
-        let _permit = &app_state
-            .rate_limiter
-            .try_acquire()
-            .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
-
-        let result = monad_debug_traceCall(
+        let raw = crate::handlers::eth::call::monad_debug_traceCall(
             triedb_env,
             eth_call_executor.clone(),
             app_state.chain_id,
             app_state.eth_call_provider_gas_limit,
-            parsed_params,
+            per_call,
         )
-            .await
-            .map(serialize_result)?;
+        .await?;
 
-        results.push(result);
+        // Convert Box<RawValue> into serde_json::Value to build an array
+        let v: serde_json::Value = serde_json::from_str(raw.get()).map_err(|e| {
+            JsonRpcError::internal_error(format!("json parse error: {}", e))
+        })?;
+        results.push(v);
     }
 
-    // возвращаем массив результатов
-    // let results_json = serde_json::to_string(&results).map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
-    // Ok(Box::from(results_json))
-    let results_raw: Vec<Box<RawValue>> = results
-        .into_iter()
-        .map(|r| serde_json::value::to_raw_value(&r).map_err(|e| JsonRpcError::internal_error(e.to_string())))
-        .collect::<Result<_, _>>()?;
-
-    Ok(serde_json::value::to_raw_value(&results_raw).into())
+    // Serialize Vec<Value> as the final result
+    serialize_result(results)
 }
 
 #[allow(non_snake_case)]
